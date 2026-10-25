@@ -39,7 +39,13 @@ from .exceptions import (
     SSLError,
     TimeoutError,
 )
-from .response import BaseHTTPResponse
+from .response import (
+    BaseHTTPResponse,
+    _release_intermediate_after_drain,
+    _resolve_urlopen_preload,
+    _resolve_urlopen_release,
+    current_response_policy,
+)
 from .util.connection import is_connection_dropped
 from .util.proxy import connection_requires_http_tunnel
 from .util.request import _TYPE_BODY_POSITION, set_file_position
@@ -724,8 +730,22 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
         if not isinstance(retries, Retry):
             retries = Retry.from_int(retries, redirect=redirect, default=self.retries)
 
+        # Merge the pushed response policy (if any) with the urlopen
+        # arguments. The merge deliberately only happens while a frame is
+        # live in this execution context; with an empty stack every value
+        # follows the pinned defaults. Concurrent urlopen calls sharing the
+        # pool carry independent ContextVar stacks.
+        response_policy_frame = current_response_policy()
+        if response_policy_frame is not None:
+            preload_content = _resolve_urlopen_preload(
+                response_policy_frame, preload_content
+            )
+
         if release_conn is None:
             release_conn = preload_content
+
+        if response_policy_frame is not None:
+            release_conn = _resolve_urlopen_release(response_policy_frame, release_conn)
 
         # Check host
         if assert_same_host and not self.is_same_host(url):
@@ -937,6 +957,12 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
                 return response
 
             response.drain_conn()
+            # Intermediate responses on a redirect chain must free their
+            # pool connection before the recursion: a hold_until_close frame
+            # applies only to the response handed to the caller, and a
+            # drain_then_release frame makes the return mandatory.
+            if _release_intermediate_after_drain(response_policy_frame):
+                response.release_conn()
             retries.sleep_for_retry(response)
             log.debug("Redirecting %s -> %s", url, redirect_location)
             return self.urlopen(
@@ -969,6 +995,11 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
                 return response
 
             response.drain_conn()
+            # Same as the redirect site: an intermediate response drained
+            # before a retry recursion must not keep its pool connection
+            # occupied.
+            if _release_intermediate_after_drain(response_policy_frame):
+                response.release_conn()
             retries.sleep(response)
             log.debug("Retry: %s", url)
             return self.urlopen(

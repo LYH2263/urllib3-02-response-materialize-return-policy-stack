@@ -18,7 +18,18 @@ from ._version import __version__
 from .connectionpool import HTTPConnectionPool, HTTPSConnectionPool, connection_from_url
 from .filepost import _TYPE_FIELDS, encode_multipart_formdata
 from .poolmanager import PoolManager, ProxyManager, proxy_from_url
-from .response import BaseHTTPResponse, HTTPResponse
+from .response import (
+    BaseHTTPResponse,
+    BodyMaterialize,
+    ConnReturn,
+    DecodeProfile,
+    HTTPResponse,
+    ResponsePolicyFrame,
+    current_response_policy,
+    pop_response_policy,
+    push_response_policy,
+    response_policy,
+)
 from .util.request import make_headers
 from .util.retry import Retry
 from .util.timeout import Timeout
@@ -66,6 +77,14 @@ __all__ = (
     "proxy_from_url",
     "request",
     "BaseHTTPResponse",
+    "BodyMaterialize",
+    "ConnReturn",
+    "DecodeProfile",
+    "ResponsePolicyFrame",
+    "current_response_policy",
+    "pop_response_policy",
+    "push_response_policy",
+    "response_policy",
 )
 
 logging.getLogger(__name__).addHandler(NullHandler())

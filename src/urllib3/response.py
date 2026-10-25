@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import enum
 import io
 import json as _json
 import logging
@@ -10,6 +11,7 @@ import typing
 import warnings
 import zlib
 from contextlib import contextmanager
+from contextvars import ContextVar, Token
 from http.client import HTTPMessage as _HttplibHTTPMessage
 from http.client import HTTPResponse as _HttplibHTTPResponse
 from socket import timeout as SocketTimeout
@@ -59,6 +61,350 @@ _READ_CHUNK_SIZE = 2**16
 # preventing a malicious server from forcing unbounded buffering (memory exhaustion)
 # via an unterminated chunk-size line.
 _MAX_CHUNK_LINE_LENGTH = 2**16
+
+
+class BodyMaterialize(enum.Enum):
+    """
+    Policy for *when* a response body is allowed to leave the wire and be
+    held as a complete body in memory.
+
+    ``PRELOAD_EAGER``
+        Align with the pinned behaviour: when ``preload_content`` is true the
+        whole body is read into ``_body`` during response construction.
+
+    ``STREAM_ONLY``
+        Construction-time preloading is forbidden and ``.data`` must not
+        silently pull and cache the whole body masquerading as a preload.
+
+    ``OPAQUE_CACHED``
+        ``.data``/``cache_content`` full-body caching is allowed, but bytes
+        already handed out through a partial/streaming read must never be
+        presented afterwards as the complete ``_body``.
+    """
+
+    PRELOAD_EAGER = "preload_eager"
+    STREAM_ONLY = "stream_only"
+    OPAQUE_CACHED = "opaque_cached"
+
+
+class DecodeProfile(enum.Enum):
+    """
+    Policy for how the read exits resolve content decoding.
+
+    ``HONOR_DEFAULT``
+        Follow the response's ``decode_content`` field and the per-call
+        ``decode_content`` argument (the pinned behaviour).
+
+    ``FORCE_RAW``
+        The frame's read exits never decode. Switching to raw after content
+        has already been decoded raises instead of silently changing tack.
+
+    ``FORBID_FLIP``
+        Keeps the pinned "``read(decode_content=True)`` followed by
+        ``read(decode_content=False)`` raises" rule and additionally forbids
+        the reverse flip inside the frame.
+    """
+
+    HONOR_DEFAULT = "honor_default"
+    FORCE_RAW = "force_raw"
+    FORBID_FLIP = "forbid_flip"
+
+
+class ConnReturn(enum.Enum):
+    """
+    Policy for *when* the response's connection goes back to the pool.
+
+    ``FOLLOW_PRELOAD``
+        Align with the pinned behaviour: ``release_conn`` defaults to
+        ``preload_content`` and exhausted responses auto-release.
+
+    ``HOLD_UNTIL_CLOSE``
+        The connection is not returned until ``close()``/``release_conn()``
+        is called explicitly. The hold applies to the response handed to the
+        caller, never to intermediate responses drained during
+        redirects/retries.
+
+    ``DRAIN_THEN_RELEASE``
+        Connections backing responses drained before a redirect/retry
+        recursion are returned to the pool once draining finishes.
+    """
+
+    FOLLOW_PRELOAD = "follow_preload"
+    HOLD_UNTIL_CLOSE = "hold_until_close"
+    DRAIN_THEN_RELEASE = "drain_then_release"
+
+
+_T = typing.TypeVar("_T", bound=enum.Enum)
+
+
+def _coerce_policy_enum(value: _T | str, enum_cls: type[_T], field_name: str) -> _T:
+    if isinstance(value, enum_cls):
+        return value
+    if isinstance(value, str):
+        try:
+            return enum_cls(value)
+        except ValueError:
+            pass
+    valid = ", ".join(member.value for member in enum_cls)
+    raise ValueError(f"Invalid {field_name} policy {value!r}, expected one of: {valid}")
+
+
+class ResponsePolicyFrame:
+    """
+    An immutable, nestable frame describing how response bodies are read and
+    how their connections are returned while the frame is pushed.
+
+    Frames are pushed/popped through :func:`push_response_policy` /
+    :func:`pop_response_policy` (or the :func:`response_policy` context
+    manager). The stack is a :class:`contextvars.ContextVar`, so two
+    concurrent ``urlopen`` calls sharing a pool in different execution
+    contexts never see each other's frames.
+    """
+
+    __slots__ = (
+        "body_materialize",
+        "decode_profile",
+        "conn_return",
+        "_token",
+    )
+
+    def __init__(
+        self,
+        body_materialize: BodyMaterialize | str,
+        decode_profile: DecodeProfile | str,
+        conn_return: ConnReturn | str,
+    ) -> None:
+        self.body_materialize = _coerce_policy_enum(
+            body_materialize, BodyMaterialize, "body_materialize"
+        )
+        self.decode_profile = _coerce_policy_enum(
+            decode_profile, DecodeProfile, "decode_profile"
+        )
+        self.conn_return = _coerce_policy_enum(conn_return, ConnReturn, "conn_return")
+        self._token: Token[tuple[ResponsePolicyFrame, ...]] | None = None
+
+    def __repr__(self) -> str:
+        return (
+            "ResponsePolicyFrame("
+            f"body_materialize={self.body_materialize.value!r}, "
+            f"decode_profile={self.decode_profile.value!r}, "
+            f"conn_return={self.conn_return.value!r})"
+        )
+
+    def __enter__(self) -> ResponsePolicyFrame:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        if self._token is not None:
+            pop_response_policy(self)
+
+    def pop(self) -> None:
+        """Pop this frame off the response policy stack."""
+        pop_response_policy(self)
+
+
+# The response-period policy stack. It lives in a ContextVar (rather than on
+# a pool or on a response) so concurrent urlopen calls sharing a pool push
+# independent stacks and nested middleware frames restore their outer frame
+# on pop.
+_response_policy_stack: ContextVar[tuple[ResponsePolicyFrame, ...]] = ContextVar(
+    "response_policy_stack", default=()
+)
+
+
+def current_response_policy() -> ResponsePolicyFrame | None:
+    """
+    Return the frame currently on top of the response policy stack, or
+    ``None`` when no frame is pushed in this execution context.
+    """
+    stack = _response_policy_stack.get()
+    return stack[-1] if stack else None
+
+
+def push_response_policy(
+    *,
+    body_materialize: BodyMaterialize | str = BodyMaterialize.PRELOAD_EAGER,
+    decode_profile: DecodeProfile | str = DecodeProfile.HONOR_DEFAULT,
+    conn_return: ConnReturn | str = ConnReturn.FOLLOW_PRELOAD,
+) -> ResponsePolicyFrame:
+    """
+    Push a response body/connection policy frame onto the stack.
+
+    The caller is responsible for popping the frame (preferably with a
+    ``try/finally`` or by using the returned frame/context manager); frames
+    pushed during a section are popped even if the section raises.
+    """
+    frame = ResponsePolicyFrame(
+        body_materialize=body_materialize,
+        decode_profile=decode_profile,
+        conn_return=conn_return,
+    )
+    token = _response_policy_stack.set(_response_policy_stack.get() + (frame,))
+    frame._token = token
+    return frame
+
+
+def pop_response_policy(frame: ResponsePolicyFrame) -> None:
+    """Pop ``frame``, restoring the stack state captured when it was pushed."""
+    token = frame._token
+    if token is None:
+        raise RuntimeError("ResponsePolicyFrame has already been popped.")
+    _response_policy_stack.reset(token)
+    frame._token = None
+
+
+@contextmanager
+def response_policy(
+    *,
+    body_materialize: BodyMaterialize | str = BodyMaterialize.PRELOAD_EAGER,
+    decode_profile: DecodeProfile | str = DecodeProfile.HONOR_DEFAULT,
+    conn_return: ConnReturn | str = ConnReturn.FOLLOW_PRELOAD,
+) -> typing.Generator[ResponsePolicyFrame, None, None]:
+    """Context manager wrapping :func:`push_response_policy`."""
+    frame = push_response_policy(
+        body_materialize=body_materialize,
+        decode_profile=decode_profile,
+        conn_return=conn_return,
+    )
+    try:
+        yield frame
+    finally:
+        if frame._token is not None:
+            pop_response_policy(frame)
+
+
+def _frame_for_response(response: BaseHTTPResponse) -> ResponsePolicyFrame | None:
+    """
+    Effective frame for a response exit.
+
+    The live stack top wins while middleware is processing the response;
+    when no frame is pushed in the current execution context the response
+    falls back to the frame it was constructed in (its response-processing
+    period), so guarantees such as ``HOLD_UNTIL_CLOSE`` survive the response
+    being read after the ``with`` block returned.
+    """
+    stack = _response_policy_stack.get()
+    if stack:
+        return stack[-1]
+    return getattr(response, "_bound_response_policy", None)
+
+
+# ---------------------------------------------------------------------------
+# Per-exit effective-view resolvers.
+#
+# The exits deliberately do NOT share one generic "get_effective" helper:
+# construction-time preloading, the .data property, the
+# read/stream/read_chunked family, drain_conn and the release/error-catcher
+# paths each merge the frame with the urlopen parameters and the response
+# fields on their own terms. In particular drain_conn follows conn_return
+# only and never applies the body_materialize caching rules.
+# ---------------------------------------------------------------------------
+
+
+def _resolve_construction_preload(
+    frame: ResponsePolicyFrame | None, preload_content: bool
+) -> bool:
+    """Construction exit: should ``__init__`` read the body eagerly?"""
+    if frame is not None and frame.body_materialize is BodyMaterialize.STREAM_ONLY:
+        return False
+    return bool(preload_content)
+
+
+def _resolve_data_materialize(
+    frame: ResponsePolicyFrame | None,
+) -> BodyMaterialize:
+    """``.data`` exit: how is whole-body materialization treated?"""
+    if frame is None:
+        return BodyMaterialize.PRELOAD_EAGER
+    return frame.body_materialize
+
+
+def _resolve_read_decode(
+    frame: ResponsePolicyFrame | None, decode_content: bool | None
+) -> bool | None:
+    """
+    read/stream/read_chunked exit: resolved decoding flag.
+
+    ``None`` is only returned when no frame applies, preserving the exact
+    pinned defaults of each read exit (``read_chunked`` defaults to raw while
+    ``read`` defaults to the response's ``decode_content`` field).
+    """
+    if frame is None:
+        return decode_content
+    if frame.decode_profile is DecodeProfile.FORCE_RAW:
+        return False
+    return bool(decode_content)
+
+
+def _resolve_read_cache_content(
+    frame: ResponsePolicyFrame | None,
+    cache_content: bool,
+    uncached_read_occurred: bool,
+) -> bool:
+    """read exit: may a full read store the result as ``_body``?"""
+    if not cache_content or frame is None:
+        return cache_content
+    if frame.body_materialize is BodyMaterialize.STREAM_ONLY:
+        raise RuntimeError(
+            "read(cache_content=True) is not allowed: the pushed "
+            "body_materialize=stream_only frame forbids caching the whole "
+            "response body."
+        )
+    if (
+        frame.body_materialize is BodyMaterialize.OPAQUE_CACHED
+        and uncached_read_occurred
+    ):
+        raise RuntimeError(
+            "read(cache_content=True) is not allowed after a partial or "
+            "streaming read: the cached bytes would not be the complete "
+            "response body (body_materialize=opaque_cached)."
+        )
+    return cache_content
+
+
+def _resolve_drain_release(frame: ResponsePolicyFrame | None) -> bool:
+    """
+    drain_conn exit: drain follows conn_return only and never the
+    body_materialize caching rules.
+    """
+    return frame is not None and frame.conn_return is ConnReturn.DRAIN_THEN_RELEASE
+
+
+def _resolve_auto_release(frame: ResponsePolicyFrame | None) -> bool:
+    """
+    release_conn/_error_catcher exit: may an exhausted/closed response hand
+    its connection back to the pool without an explicit release call?
+    """
+    if frame is not None and frame.conn_return is ConnReturn.HOLD_UNTIL_CLOSE:
+        return False
+    return True
+
+
+def _resolve_urlopen_preload(
+    frame: ResponsePolicyFrame | None, preload_content: bool
+) -> bool:
+    """urlopen construction merge: effective ``preload_content``."""
+    return _resolve_construction_preload(frame, preload_content)
+
+
+def _resolve_urlopen_release(
+    frame: ResponsePolicyFrame | None, release_conn: bool | None
+) -> bool | None:
+    """urlopen merge: effective ``release_conn`` after the preload default."""
+    if frame is not None and frame.conn_return is ConnReturn.HOLD_UNTIL_CLOSE:
+        return False
+    return release_conn
+
+
+def _release_intermediate_after_drain(frame: ResponsePolicyFrame | None) -> bool:
+    """
+    Whether the redirect/retry machinery must explicitly return an
+    intermediate response's connection after draining it. A hold must never
+    keep pool connections occupied through a redirect/retry recursion.
+    """
+    if frame is None:
+        return False
+    return frame.conn_return is not ConnReturn.FOLLOW_PRELOAD
 
 
 class ContentDecoder:
@@ -501,6 +847,11 @@ class BaseHTTPResponse(io.IOBase):
         self.reason = reason
         self.decode_content = decode_content
         self._has_decoded_content = False
+        # Observation flag used by the forbid_flip decode profile to detect
+        # the reverse flip (raw read followed by decoded read). It is only
+        # consulted while a policy frame applies, so the pinned behaviour is
+        # untouched.
+        self._has_undecoded_content = False
         self._request_url: str | None = request_url
         self.retries = retries
 
@@ -655,7 +1006,22 @@ class BaseHTTPResponse(io.IOBase):
                     "Calling read(decode_content=False) is not supported after "
                     "read(decode_content=True) was called."
                 )
+            if self._decoder is not None:
+                # Raw bytes of an encoded body have already been handed out,
+                # so forbid_flip can reject a later decoded read.
+                self._has_undecoded_content = True
             return data
+
+        frame = _frame_for_response(self)
+        if (
+            frame is not None
+            and frame.decode_profile is DecodeProfile.FORBID_FLIP
+            and self._has_undecoded_content
+        ):
+            raise RuntimeError(
+                "Calling read(decode_content=True) is not supported after "
+                "read(decode_content=False) was called in this frame."
+            )
 
         if max_length is None or flush_decoder:
             max_length = -1
@@ -784,6 +1150,11 @@ class HTTPResponse(BaseHTTPResponse):
         self._fp_bytes_read = 0
         self.msg = msg
 
+        # Bind the response to the response-processing period it is created
+        # in. The bound frame is only consulted when no live frame applies;
+        # it never mutates any response field or pool-level default.
+        self._bound_response_policy = current_response_policy()
+
         if body and isinstance(body, (str, bytes)):
             self._body = body
 
@@ -803,8 +1174,14 @@ class HTTPResponse(BaseHTTPResponse):
         # Used to return the correct amount of bytes for partial read()s
         self._decoded_buffer = BytesQueueBuffer()
 
-        # If requested, preload the body.
-        if preload_content and not self._body:
+        # Construction exit: eagerly read the body only when both the
+        # preload_content argument and the pushed materialize policy allow
+        # it. stream_only forbids construction-time preloading even when
+        # the caller passed preload_content=True.
+        if (
+            _resolve_construction_preload(self._bound_response_policy, preload_content)
+            and not self._body
+        ):
             self._body = self.read(decode_content=decode_content)
 
     def release_conn(self) -> None:
@@ -831,6 +1208,11 @@ class HTTPResponse(BaseHTTPResponse):
             self._decoded_buffer = BytesQueueBuffer()
             self._decoder = None
 
+        # drain_conn has its own exit resolution: it follows conn_return
+        # only (never the body_materialize caching rules).
+        if _resolve_drain_release(_frame_for_response(self)):
+            self.release_conn()
+
     @property
     def data(self) -> bytes:
         # For backwards-compat with earlier urllib3 0.4 and earlier.
@@ -838,6 +1220,27 @@ class HTTPResponse(BaseHTTPResponse):
             return self._body  # type: ignore[return-value]
 
         if self._fp:
+            # The .data exit is resolved separately from the read exits:
+            # stream_only forbids pulling/caching a whole body here, and
+            # opaque_cached refuses to present a half-streamed remainder as
+            # the complete body.
+            materialize = _resolve_data_materialize(_frame_for_response(self))
+            if materialize is BodyMaterialize.STREAM_ONLY:
+                raise RuntimeError(
+                    "HTTPResponse.data is disabled: the pushed "
+                    "body_materialize=stream_only frame forbids materializing "
+                    "the whole response body; use read()/stream() instead."
+                )
+            if (
+                materialize is BodyMaterialize.OPAQUE_CACHED
+                and self._uncached_read_occurred
+            ):
+                raise RuntimeError(
+                    "HTTPResponse.data is unavailable after a partial or "
+                    "streaming read: only a remaining fragment could be "
+                    "returned, not the complete response body "
+                    "(body_materialize=opaque_cached)."
+                )
             return self.read(cache_content=True)
 
         return None  # type: ignore[return-value]
@@ -971,8 +1374,15 @@ class HTTPResponse(BaseHTTPResponse):
                     self._connection.close()
 
             # If we hold the original response but it's closed now, we should
-            # return the connection back to the pool.
-            if self._original_response and self._original_response.isclosed():
+            # return the connection back to the pool. The release/error
+            # catcher exit resolves conn_return on its own: a
+            # hold_until_close frame keeps the connection until an explicit
+            # release_conn()/close().
+            if (
+                self._original_response
+                and self._original_response.isclosed()
+                and _resolve_auto_release(_frame_for_response(self))
+            ):
                 self.release_conn()
 
     def _fp_read(
@@ -1110,6 +1520,10 @@ class HTTPResponse(BaseHTTPResponse):
         if decode_content is None:
             decode_content = self.decode_content
 
+        # read/stream/read_chunked exit: merge the frame's decode profile
+        # with the per-call argument and the response field.
+        decode_content = _resolve_read_decode(_frame_for_response(self), decode_content)
+
         if amt and amt < 0:
             # Negative numbers and `None` should be treated the same.
             amt = None
@@ -1130,6 +1544,15 @@ class HTTPResponse(BaseHTTPResponse):
                 self._decoded_buffer.put(decoded_data)
             if len(self._decoded_buffer) >= amt:
                 return self._decoded_buffer.get(amt)
+
+        # read exit: a pushed materialize policy may forbid whole-body
+        # caching (stream_only) or caching after a partial read
+        # (opaque_cached).
+        cache_content = _resolve_read_cache_content(
+            _frame_for_response(self),
+            cache_content,
+            self._uncached_read_occurred,
+        )
 
         data = self._raw_read(amt)
         if not cache_content:
@@ -1162,6 +1585,8 @@ class HTTPResponse(BaseHTTPResponse):
                         "Calling read(decode_content=False) is not supported after "
                         "read(decode_content=True) was called."
                     )
+                if self._decoder is not None:
+                    self._has_undecoded_content = True
                 return data
 
             decoded_data = self._decode(
@@ -1207,6 +1632,8 @@ class HTTPResponse(BaseHTTPResponse):
         """
         if decode_content is None:
             decode_content = self.decode_content
+        # read/stream/read_chunked exit: merge the frame's decode profile.
+        decode_content = _resolve_read_decode(_frame_for_response(self), decode_content)
         if amt and amt < 0:
             # Negative numbers and `None` should be treated the same.
             amt = None
@@ -1242,6 +1669,14 @@ class HTTPResponse(BaseHTTPResponse):
         data = self._raw_read(amt, read1=True)
         self._uncached_read_occurred = True
         if not decode_content or data is None:
+            # Record raw bytes handed out of an encoded body so a
+            # forbid_flip frame can reject a later flip to decoding.
+            if data is not None and not decode_content:
+                frame = _frame_for_response(self)
+                if frame is not None:
+                    self._init_decoder()
+                    if self._decoder is not None:
+                        self._has_undecoded_content = True
             return data
 
         self._init_decoder()
@@ -1421,6 +1856,11 @@ class HTTPResponse(BaseHTTPResponse):
             'content-encoding' header.
         """
         self._init_decoder()
+        # read/stream/read_chunked exit: a direct read_chunked() call keeps
+        # the pinned raw default (decode_content=None), while a pushed frame
+        # applies its decode profile (force_raw -> raw, forbid_flip ->
+        # enforced).
+        decode_content = _resolve_read_decode(_frame_for_response(self), decode_content)
         # FIXME: Rewrite this method and make it a class with a better structured logic.
         if not self.chunked:
             raise ResponseNotChunked(
